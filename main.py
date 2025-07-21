@@ -1,13 +1,13 @@
 import os
-import json
-import re
-import urllib.request
-from pathlib import Path
 from tqdm import tqdm
 
 import torch
 import torch.nn as nn
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+from datasets import load_dataset
+
+from preprocessing import preprocess
+from tokenizer import CodeTokenizer
 
 
 INFERENCE_MODE = os.getenv('INFERENCE_MODE', '0') != '0'
@@ -323,354 +323,195 @@ class RMSNorm(nn.Module):
         return norm_x.to(input_dtype)
 
 
-def load_weights_into_qwen(model, param_config, params):
-    def assign(left, right, tensor_name="unknown"):
-        if left.shape != right.shape:
-            raise ValueError(f"Shape mismatch in tensor '{tensor_name}'. Left: {left.shape}, Right: {right.shape}")
-        return torch.nn.Parameter(right.clone().detach() if isinstance(right, torch.Tensor) else torch.tensor(right))
+def data_generator(dataset, tokenizer, block_size):
+    """
+    A generator that yields token sequences of a specified block size from the dataset.
+    """
+    buffer = []
+    for sample in iter(dataset):
+        content = preprocess(sample['content'])
+        if not content:
+            continue
 
-    model.tok_emb.weight = assign(model.tok_emb.weight, params["model.embed_tokens.weight"], "model.embed_tokens.weight")
+        # Add a separator token between files
+        content = content + " <|endoftext|>"
+        tokens = tokenizer.encode(content).ids
+        buffer.extend(tokens)
 
-    for l in range(param_config["n_layers"]):
-        block = model.trf_blocks[l]
-        att = block.att
-
-        # Q, K, V projections
-        att.W_query.weight = assign(
-            att.W_query.weight,
-            params[f"model.layers.{l}.self_attn.q_proj.weight"],
-            f"model.layers.{l}.self_attn.q_proj.weight"
-        )
-        att.W_key.weight = assign(
-            att.W_key.weight,
-            params[f"model.layers.{l}.self_attn.k_proj.weight"],
-            f"model.layers.{l}.self_attn.k_proj.weight"
-        )
-        att.W_value.weight = assign(
-            att.W_value.weight,
-            params[f"model.layers.{l}.self_attn.v_proj.weight"],
-            f"model.layers.{l}.self_attn.v_proj.weight"
-        )
-
-        # Output projection
-        att.out_proj.weight = assign(
-            att.out_proj.weight,
-            params[f"model.layers.{l}.self_attn.o_proj.weight"],
-            f"model.layers.{l}.self_attn.o_proj.weight"
-        )
-
-        # QK norms
-        if hasattr(att, "q_norm") and att.q_norm is not None:
-            att.q_norm.scale = assign(
-                att.q_norm.scale,
-                params[f"model.layers.{l}.self_attn.q_norm.weight"],
-                f"model.layers.{l}.self_attn.q_norm.weight"
-            )
-        if hasattr(att, "k_norm") and att.k_norm is not None:
-            att.k_norm.scale = assign(
-                att.k_norm.scale,
-                params[f"model.layers.{l}.self_attn.k_norm.weight"],
-                f"model.layers.{l}.self_attn.k_norm.weight"
-            )
-
-        # Attention layernorm
-        block.norm1.scale = assign(
-            block.norm1.scale,
-            params[f"model.layers.{l}.input_layernorm.weight"],
-            f"model.layers.{l}.input_layernorm.weight"
-        )
-
-        # Feedforward weights
-        block.ff.fc1.weight = assign(
-            block.ff.fc1.weight,
-            params[f"model.layers.{l}.mlp.gate_proj.weight"],
-            f"model.layers.{l}.mlp.gate_proj.weight"
-        )
-        block.ff.fc2.weight = assign(
-            block.ff.fc2.weight,
-            params[f"model.layers.{l}.mlp.up_proj.weight"],
-            f"model.layers.{l}.mlp.up_proj.weight"
-        )
-        block.ff.fc3.weight = assign(
-            block.ff.fc3.weight,
-            params[f"model.layers.{l}.mlp.down_proj.weight"],
-            f"model.layers.{l}.mlp.down_proj.weight"
-        )
-        block.norm2.scale = assign(
-            block.norm2.scale,
-            params[f"model.layers.{l}.post_attention_layernorm.weight"],
-            f"model.layers.{l}.post_attention_layernorm.weight"
-        )
-
-    # Final normalization and output head
-    model.final_norm.scale = assign(model.final_norm.scale, params["model.norm.weight"], "model.norm.weight")
-
-    # Model uses weight tying, hence we reuse the embedding layer weights here
-    model.out_head.weight = assign(model.out_head.weight, params["model.embed_tokens.weight"], "model.embed_tokens.weight")
+        while len(buffer) >= block_size + 1:
+            chunk = buffer[:block_size + 1]
+            buffer = buffer[block_size + 1:]
+            yield torch.tensor(chunk, dtype=torch.long)
 
 
-class Qwen3Tokenizer:
-    _SPECIALS = [
-        "<|endoftext|>",
-        "<|im_start|>", "<|im_end|>",
-        "<|object_ref_start|>", "<|object_ref_end|>",
-        "<|box_start|>", "<|box_end|>",
-        "<|quad_start|>", "<|quad_end|>",
-        "<|vision_start|>", "<|vision_end|>",
-        "<|vision_pad|>", "<|image_pad|>", "<|video_pad|>",
-    ]
-    _SPLIT_RE = re.compile(r"(<\|[^>]+?\|>)")
+def get_batch(generator, batch_size, device):
+    """
+    Creates a batch of data from the data generator.
+    """
+    x_list, y_list = [], []
+    for _ in range(batch_size):
+        try:
+            chunk = next(generator)
+            x_list.append(chunk[:-1])
+            y_list.append(chunk[1:])
+        except StopIteration:
+            # Not enough data for a full batch, can happen at the end
+            break
+    
+    if not x_list:
+        return None, None
+        
+    x = torch.stack(x_list)
+    y = torch.stack(y_list)
+    return x.to(device), y.to(device)
 
-    def __init__(self, tokenizer_file_path="tokenizer.json", repo_id=None,
-                 apply_chat_template=True, add_generation_prompt=False, add_thinking=False):
-        from tokenizers import Tokenizer
-
-        self.apply_chat_template = apply_chat_template
-        self.add_generation_prompt = add_generation_prompt
-        self.add_thinking = add_thinking
-
-        tok_file = Path(tokenizer_file_path)
-        if not tok_file.is_file() and repo_id:
-            download_from_huggingface(
-                repo_id=repo_id,
-                filename=tok_file.name,
-                local_dir=str(tok_file.parent),
-            )
-        self._tok = Tokenizer.from_file(str(tok_file))
-        self._special_to_id = {t: self._tok.token_to_id(t) for t in self._SPECIALS}
-
-        self.pad_token_id = self._special_to_id.get("<|endoftext|>")
-        self.eos_token_id = self.pad_token_id
-
-        if repo_id and "Base" not in repo_id:
-            eos_token = "<|im_end|>"
-        else:
-            eos_token = "<|endoftext|>"
-        if eos_token in self._special_to_id:
-            self.eos_token_id = self._special_to_id[eos_token]
-
-    def encode(self, text, chat_wrapped=None):
-        if chat_wrapped is None:
-            chat_wrapped = self.apply_chat_template
-
-        stripped = text.strip()
-        if stripped in self._special_to_id and "\n" not in stripped:
-            return [self._special_to_id[stripped]]
-
-        if chat_wrapped:
-            text = self._wrap_chat(text)
-
-        ids = []
-        for part in filter(None, self._SPLIT_RE.split(text)):
-            if part in self._special_to_id:
-                ids.append(self._special_to_id[part])
-            else:
-                ids.extend(self._tok.encode(part).ids)
-        return ids
-
-    def decode(self, ids):
-        return self._tok.decode(ids, skip_special_tokens=False)
-
-    def _wrap_chat(self, user_msg):
-        s = f"<|im_start|>user\n{user_msg}<|im_end|>\n"
-        if self.add_generation_prompt:
-            s += "<|im_start|>assistant"
-            if self.add_thinking:
-                s += "\n"
-            else:
-                s += "\n<think>\n\n</think>\n\n"
-        return s
-
-
-def download_from_huggingface(repo_id, filename, local_dir, revision="main"):
-    base_url = "https://huggingface.co"
-    url = f"{base_url}/{repo_id}/resolve/{revision}/{filename}"
-    Path(local_dir).mkdir(parents=True, exist_ok=True)
-    dest_path = os.path.join(local_dir, filename)
-
-    if os.path.exists(dest_path):
-        print(f"File already exists: {dest_path}")
-    else:
-        print(f"Downloading {url} to {dest_path}...")
-        urllib.request.urlretrieve(url, dest_path)
-
-    return dest_path
-
-
-def download_from_huggingface_from_snapshots(repo_id, local_dir):
-    from huggingface_hub import hf_hub_download, snapshot_download
-    from safetensors.torch import load_file  # or your preferred loader
-
-    repo_dir = snapshot_download(repo_id=repo_id, local_dir=local_dir)
-
-    index_path = os.path.join(repo_dir, "model.safetensors.index.json")
-    single_file_path = os.path.join(repo_dir, "model.safetensors")
-
-    if os.path.exists(index_path):
-        # Multi-shard model
-        with open(index_path, "r") as f:
-            index = json.load(f)
-
-        weights_dict = {}
-        for filename in set(index["weight_map"].values()):
-            shard_path = os.path.join(repo_dir, filename)
-            shard = load_file(shard_path)
-            weights_dict.update(shard)
-    elif os.path.exists(single_file_path):
-        # Single-shard model
-        weights_file = hf_hub_download(
-            repo_id=repo_id,
-            filename="model.safetensors",
-            local_dir=local_dir,
-        )
-        weights_dict = load_file(weights_file)
-    else:
-        raise FileNotFoundError("No model.safetensors or model.safetensors.index.json found.")
-
-    return weights_dict
-
-
-def download_shakespeare_data(url, save_path):
-    """Downloads the Tiny Shakespeare dataset."""
-    if not os.path.exists(save_path):
-        print("Downloading Tiny Shakespeare dataset...")
-        response = requests.get(url)
-        with open(save_path, 'w') as f:
-            f.write(response.text)
-        print("Dataset downloaded.")
-    else:
-        print("Dataset already exists.")
-
-def get_data_loader(text, batch_size, block_size, device):
-    """Creates a simple data loader for the Shakespeare text."""
-    # Create a character-level vocabulary
-    chars = sorted(list(set(text)))
-    vocab_size = len(chars)
-    stoi = {ch: i for i, ch in enumerate(chars)}
-    itos = {i: ch for i, ch in enumerate(chars)}
-    encode = lambda s: [stoi[c] for c in s]
-    decode = lambda l: ''.join([itos[i] for i in l])
-
-    data = torch.tensor(encode(text), dtype=torch.long)
-    n = int(0.9 * len(data))
-    train_data, val_data = data[:n], data[n:]
-
-    def get_batch(split):
-        data = train_data if split == 'train' else val_data
-        ix = torch.randint(len(data) - block_size, (batch_size,))
-        x = torch.stack([data[i:i + block_size] for i in ix])
-        y = torch.stack([data[i + 1:i + block_size + 1] for i in ix])
-        return x.to(device), y.to(device)
-
-    return get_batch, vocab_size, decode
 
 @torch.no_grad()
-def estimate_loss(model, get_batch, loss_fn, eval_iters):
+def estimate_loss(model, data_gen_factory, loss_fn, eval_iters, batch_size, device):
     out = {}
     model.eval()
-    for split in ['train', 'val']:
-        losses = torch.zeros(eval_iters)
-        for k in range(eval_iters):
-            X, Y = get_batch(split)
-            logits = model(X)
-            B, T, C = logits.shape
-            logits = logits.view(B * T, C)
-            targets = Y.view(B * T)
-            loss = loss_fn(logits, targets)
-            losses[k] = loss.item()
-        out[split] = losses.mean()
+    
+    val_generator = data_gen_factory('val')
+    
+    losses = torch.zeros(eval_iters)
+    for k in range(eval_iters):
+        X, Y = get_batch(val_generator, batch_size, device)
+        if X is None:
+            losses = losses[:k]
+            break
+        logits = model(X)
+        B, T, C = logits.shape
+        logits = logits.view(B * T, C)
+        targets = Y.view(B * T)
+        loss = loss_fn(logits, targets)
+        losses[k] = loss.item()
+    
+    out['val'] = losses.mean()
     model.train()
     return out
 
+
 @torch.no_grad()
-def generate(model, start_string, max_new_tokens, decode, device):
-    """Performs inference to generate new text."""
+def generate(model, tokenizer, start_string, max_new_tokens, device):
+    """
+    Performs inference to generate new text, safely preserving the model's training state.
+    """
+    # Store original training mode
+    is_training = model.training
     model.eval()
-    # For a character-level model, we need to create the encoder here as well
-    chars = sorted(list(set(open('shakespeare.txt', 'r').read())))
-    stoi = {ch: i for i, ch in enumerate(chars)}
     
-    start_ids = [stoi[c] for c in start_string]
+    start_ids = tokenizer.encode(start_string).ids
     x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
     block_size = model.cfg["context_length"]
     
     for _ in range(max_new_tokens):
+        # Crop context if it exceeds model's block size
         x_cond = x if x.size(1) <= block_size else x[:, -block_size:]
+        
         logits = model(x_cond)
         logits = logits[:, -1, :] # Get logits for the last token
         probs = torch.softmax(logits, dim=-1)
         next_id = torch.multinomial(probs, num_samples=1)
+        
+        # Stop if end of text token is generated
+        if next_id.item() == tokenizer.eos_token_id:
+            break
+            
         x = torch.cat((x, next_id), dim=1)
 
-    return decode(x[0].tolist())
+    generated_text = tokenizer.decode(x[0].tolist())
+    
+    # Restore original training mode
+    if is_training:
+        model.train()
+    
+    breakpoint()
+        
+    return generated_text
 
 
 def main():
     # Hyperparameters
-    BATCH_SIZE = 16
-    BLOCK_SIZE = 32
-    LEARNING_RATE = 1e-3
-    TRAINING_STEPS = 100000
-    EVAL_INTERVAL = 1000
-    EVAL_ITERS = 100
+    BATCH_SIZE = 8
+    BLOCK_SIZE = 256
+    LEARNING_RATE = 1e-4
+    TRAINING_STEPS = 50000
+    EVAL_INTERVAL = 500
+    EVAL_ITERS = 50
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    # Download data
-    DATA_URL = 'https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt'
-    DATA_PATH = 'shakespeare.txt'
-    download_shakespeare_data(DATA_URL, DATA_PATH)
+    BEST_MODEL_PATH = 'python_model.pth'
 
-    BEST_MODEL_PATH = 'model.pth'
+    print("Initializing tokenizer...")
+    # pycharm people used a special tokenizer for python code
+    tokenizer = CodeTokenizer().load('./tokenizer_training_data/custom_code_tokenizer.json')
 
-    # Load data
-    with open(DATA_PATH, 'r', encoding='utf-8') as f:
-        text = f.read()
+    def data_gen_factory(split):
+        if split == 'train':
+            dataset = load_dataset("bigcode/the-stack", data_dir="data/python", split="train", streaming=True)
+        else:
+            # For validation, we take a small, non-streamed part of the dataset to have consistent validation loss.
+            # Here we are just re-using the start of the training set for simplicity. 
+            # In a real scenario, you'd use a dedicated validation split.
+            dataset = load_dataset("bigcode/the-stack", data_dir="data/python", split="train", streaming=True).take(1000)
+        return data_generator(dataset, tokenizer, BLOCK_SIZE)
 
-    get_batch, vocab_size, decode = get_data_loader(text, BATCH_SIZE, BLOCK_SIZE, DEVICE)
+    train_generator = data_gen_factory('train')
 
-    # For this small dataset, we will override the config
-    # to create a much smaller model.
-    shakespeare_config = {
-        "vocab_size": vocab_size,
-        "context_length": BLOCK_SIZE,
-        "emb_dim": 128,
-        "n_heads": 4,
-        "n_layers": 4,
-        "hidden_dim": 256,
-        "head_dim": 32,
-        "qk_norm": False,
-        "n_kv_groups": 2,
-        "rope_base": 10000.0,
-        "dtype": torch.bfloat16,
-    }
+    model_config = QWEN_CONFIG_06_B
+    model_config["vocab_size"] = tokenizer.get_vocab_size()
+    model_config["context_length"] = BLOCK_SIZE
+    
+    model = Qwen3Model(model_config).to(DEVICE)
+    print(f"Model has {sum(p.numel() for p in model.parameters())/1e6:.2f}M parameters")
+    
+    # Using torch.compile for a speed-up
+    try:
+        model = torch.compile(model)
+    except Exception as e:
+        print(f"Could not compile model: {e}. Running un-compiled.")
 
-    # Initialize model, optimizer, and loss
-    model = Qwen3Model(shakespeare_config).to(DEVICE)
-    model = torch.compile(model)
-    # model = Qwen3Model(QWEN_CONFIG_06_B).to(DEVICE)
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
     loss_fn = nn.CrossEntropyLoss()
 
-    WARMUP_STEPS = round(TRAINING_STEPS * 0.2)
-    warmup_scheduler = LinearLR(optimizer, start_factor=0.001, end_factor=1.0, total_iters=WARMUP_STEPS)
+    WARMUP_STEPS = round(TRAINING_STEPS * 0.1)
     main_scheduler = CosineAnnealingLR(optimizer, T_max=TRAINING_STEPS - WARMUP_STEPS, eta_min=LEARNING_RATE * 0.1)
+    warmup_scheduler = LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=WARMUP_STEPS)
     scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, main_scheduler], milestones=[WARMUP_STEPS])
 
-    # Train the model
-    print("\nStarting training...")
+    print(f"\nStarting training on {DEVICE}...")
     best_val_loss = float('inf')
 
-    for step in tqdm(range(TRAINING_STEPS), desc='Training'):
+    pbar = tqdm(range(TRAINING_STEPS), desc='Training')
+    for step in pbar:
         if step % EVAL_INTERVAL == 0 or step == TRAINING_STEPS - 1:
-            losses = estimate_loss(model, get_batch, loss_fn, EVAL_ITERS)
-            print(f'\nStep {step}: train loss {losses["train"]:.4f}, val loss {losses["val"]:.4f}')
+            losses = estimate_loss(model, data_gen_factory, loss_fn, EVAL_ITERS, BATCH_SIZE, DEVICE)
+            val_loss = losses.get('val', float('inf'))
+            print(f'\n\nStep {step}: validation loss {val_loss:.4f}')
 
-            if losses['val'] < best_val_loss:
-                torch.save(model.state_dict(), BEST_MODEL_PATH)
-                print(f'New best val loss {best_val_loss:.4f} -> {losses["val"]:.4f}. Saving new model to {BEST_MODEL_PATH}')
-                best_val_loss = losses['val']
+            print(f"--- Generating sample text at step {step} ---")
+            start_prompt = "import torch\n\ndef forward(self, x):"
+            generated_text = generate(
+                model, 
+                tokenizer, 
+                start_string=start_prompt, 
+                max_new_tokens=100, 
+                device=DEVICE
+            )
+            print(generated_text)
+            print("--- End of sample ---\n")
 
-        xb, yb = get_batch('train')
+            if val_loss < best_val_loss:
+                # state_dict() on compiled model needs to be handled on the original model
+                model_to_save = model._orig_mod if hasattr(model, '_orig_mod') else model
+                torch.save(model_to_save.state_dict(), BEST_MODEL_PATH)
+                print(f'New best val loss {best_val_loss:.4f} -> {val_loss:.4f}. Saving new model to {BEST_MODEL_PATH}\n')
+                best_val_loss = val_loss
+
+        xb, yb = get_batch(train_generator, BATCH_SIZE, DEVICE)
+        if xb is None:
+            print("Data generator exhausted. Ending training.")
+            break
 
         logits = model(xb)
         B, T, C = logits.shape
@@ -683,20 +524,28 @@ def main():
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         scheduler.step()
-    
+        
+        current_lr = scheduler.get_last_lr()[0]
+        pbar.set_description(f"Training (loss: {loss.item():.4f}, lr: {current_lr:.6f})")
+
     print('Training finished.')
 
     if os.path.exists(BEST_MODEL_PATH):
-        model.load_state_dict(torch.load(BEST_MODEL_PATH))
-        print("Loaded best model weights for generation.")
+        final_model_config = QWEN_CONFIG_06_B
+        final_model_config["vocab_size"] = tokenizer.vocab_size
+        final_model_config["context_length"] = BLOCK_SIZE
+        model_to_load = Qwen3Model(final_model_config).to(DEVICE)
+        model_to_load.load_state_dict(torch.load(BEST_MODEL_PATH))
+        print("Loaded best model weights.")
     else:
         print("No best model found, using the final model for generation.")
+        model_to_load = model._orig_mod if hasattr(model, '_orig_mod') else model
 
-    # Perform inference
-    print("\nTraining finished. Generating text...")
-    start_prompt = "JULIET:\nO Romeo, Romeo! wherefore art thou"
-    generated_text = generate(model, start_prompt, max_new_tokens=200, decode=decode, device=DEVICE)
-    print("\n--- GENERATED TEXT ---")
+
+    print("\nGenerating final Python code sample...")
+    start_prompt = "import torch\n\ndef forward(self, x):"
+    generated_text = generate(model_to_load, tokenizer, start_string=start_prompt, max_new_tokens=150, device=DEVICE)
+    print("\n--- FINAL GENERATED CODE ---")
     print(generated_text)
 
 if __name__ == '__main__':
