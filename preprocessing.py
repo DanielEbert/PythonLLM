@@ -1,25 +1,31 @@
-import io
-import random
-import tokenize
-import sys
-
-import io
 import random
 import sys
-import tokenize
+import string
+import random
+import sys
 
-from tokenize_rt import src_to_tokens, tokens_to_src, Token, NON_CODING_TOKENS
+from tokenize_rt import src_to_tokens, tokens_to_src, Token
 import ast
 
 
+def sanitize_input(text: str) -> str:
+    """
+    Replaces all non-printable ASCII characters with a single special character.
+    """
+    # Using string.printable which includes digits, ascii_letters, punctuation, and whitespace.
+    return ''.join([char if char in string.printable else '?' for char in text])
+
+
 def preprocess(source: str, dropout_chance: float = 0.5) -> str:
+    source = sanitize_input(source)
+
     try:
         tree = ast.parse(source)
         docstring_nodes = set()
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.ClassDef, ast.Module)) and \
                     node.body and isinstance(node.body[0], ast.Expr) and \
-                    isinstance(node.body[0].value, ast.Str):
+                    isinstance(node.body[0].value, ast.Constant):
                 docstring_nodes.add(node.body[0].lineno)
     except (SyntaxError, ValueError):
         # If the source is not valid Python, we can't reliably find docstrings

@@ -53,6 +53,12 @@ class CodeTokenizer:
     def get_vocab_size(self):
         return self.tokenizer.get_vocab_size()
     
+    def get_vocab(self):
+        return self.tokenizer.get_vocab()
+    
+    def token_to_id(self, token: str) -> int:
+        return self.tokenizer.token_to_id(token)
+    
     @property
     def eos_token_id(self):
         return self.tokenizer.token_to_id("<|endoftext|>")
@@ -145,20 +151,14 @@ def main():
     print("="*50 + "\n")
 
     # The tokenizer now expects text that has been preprocessed
-    test_case = """<SCOPE_IN>
-    for i in range(10):
-<SCOPE_IN>
-        print(f"Number: {i}")
-<SCOPE_OUT>
-<SCOPE_OUT>"""
+    test_case = """<SCOPE_IN>for i in range(10):
+<SCOPE_IN>print(f"Number: {i}")
+<SCOPE_OUT><SCOPE_OUT>"""
     encoding = code_tokenizer.encode(test_case)
     print(f"Test Case: '{test_case}'")
     print(f" -> Tokens: {encoding.tokens}")
     print(f" -> IDs: {encoding.ids}\n")
     
-    # You can now integrate this saved tokenizer ("custom_code_tokenizer.json")
-    # into your main model training pipeline as described in the previous answer.
-
 
 if __name__ == "__main__":
     main()

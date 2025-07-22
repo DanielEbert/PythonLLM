@@ -1,3 +1,7 @@
 *.pth
 tokenizer_training_data/
 __pycache__
+kernel_report.ncu-rep
+log/
+prof.qdstrm
+prof20.nsys-rep

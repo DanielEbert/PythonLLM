@@ -3,8 +3,10 @@ from tqdm import tqdm
 
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from datasets import load_dataset
+import numpy as np
 
 from preprocessing import preprocess
 from tokenizer import CodeTokenizer
@@ -323,62 +325,176 @@ class RMSNorm(nn.Module):
         return norm_x.to(input_dtype)
 
 
-def data_generator(dataset, tokenizer, block_size):
-    """
-    A generator that yields token sequences of a specified block size from the dataset.
-    """
-    buffer = []
-    for sample in iter(dataset):
-        content = preprocess(sample['content'])
-        if not content:
-            continue
-
-        # Add a separator token between files
-        content = content + " <|endoftext|>"
-        tokens = tokenizer.encode(content).ids
-        buffer.extend(tokens)
-
-        while len(buffer) >= block_size + 1:
-            chunk = buffer[:block_size + 1]
-            buffer = buffer[block_size + 1:]
-            yield torch.tensor(chunk, dtype=torch.long)
-
-
-def get_batch(generator, batch_size, device):
-    """
-    Creates a batch of data from the data generator.
-    """
-    x_list, y_list = [], []
-    for _ in range(batch_size):
-        try:
-            chunk = next(generator)
-            x_list.append(chunk[:-1])
-            y_list.append(chunk[1:])
-        except StopIteration:
-            # Not enough data for a full batch, can happen at the end
-            break
+class StreamingTokenizedDataset(torch.utils.data.IterableDataset):
+    def __init__(self, dataset, tokenizer, block_size):
+        super().__init__()
+        self.dataset = dataset
+        self.tokenizer = tokenizer
+        self.block_size = block_size
     
-    if not x_list:
-        return None, None
+    def __iter__(self):
+        buffer = []
+
+        for sample in self.dataset:
+            content = preprocess(sample['content'])
+            if not content:
+                continue
+
+            # Add a separator token between files
+            content = content + " <|endoftext|>"
+            tokens = self.tokenizer.encode(content).ids
+            buffer.extend(tokens)
+
+            # Yield complete blocks of tokens
+            while len(buffer) >= self.block_size + 1:
+                chunk = torch.tensor(buffer[:self.block_size + 1], dtype=torch.long)
+                buffer = buffer[self.block_size + 1:]
+                x = chunk[:-1]
+                y = chunk[1:]
+                yield x, y
+
+
+class FullLineGenerator:
+    def __init__(self, model, tokenizer, device, beam_width=5, max_iterations=20, stop_factor_k=3):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.device = device
+        self.beam_width = beam_width
+        self.max_iterations = max_iterations
+        self.stop_factor_k = stop_factor_k
+
+        # Get the vocabulary for token healing. Assumes tokenizer has a get_vocab() method.
+        self.vocab = self.tokenizer.get_vocab().keys()
+        # The blog post specifically mentions collecting hypotheses ending in newline.
+        # Ensure your tokenizer includes '\n' or use an appropriate end-of-line token.
+        self.newline_token_id = self.tokenizer.token_to_id("\n")
+        if self.newline_token_id is None:
+            raise ValueError("Tokenizer must have a newline '\\n' character in its vocabulary.")
+
+    @torch.no_grad()
+    def _token_healing(self, line_prefix):
+        for i in range(len(line_prefix), -1, -1):
+            # The part of the token the user might have started typing
+            incomplete_token_part = line_prefix[i:]
+            
+            # Check if this incomplete part is a prefix of any token in the vocab
+            is_prefix = any(
+                token.startswith(incomplete_token_part) and token != incomplete_token_part
+                for token in self.vocab
+            )
+            
+            if not is_prefix:
+                # We've found the split point. The character at i-1 is not part
+                # of an incomplete token.
+                context = line_prefix[:i]
+                prefix_to_match = line_prefix[i:]
+                return context, prefix_to_match
         
-    x = torch.stack(x_list)
-    y = torch.stack(y_list)
-    return x.to(device), y.to(device)
+        # This case should not be reached if i goes to 0.
+        return "", line_prefix
+
+    @torch.no_grad()
+    def generate(self, current_line):
+        """
+        Generates a line completion using a modified beam search.
+        """
+        is_training = self.model.training
+        self.model.eval()
+
+        # 1. TOKEN HEALING
+        healed_context, prefix_to_filter = self._token_healing(current_line)
+        
+        context_ids = self.tokenizer.encode(healed_context).ids
+        
+        # Initialize beams: (log_probability, sequence_of_ids)
+        active_beams = [(-0.0, context_ids)]
+        terminated_hypotheses = []
+        block_size = self.model.cfg["context_length"]
+
+        # 2. DYNAMIC BEAM SEARCH LOOP
+        for step in range(self.max_iterations):
+            if not active_beams:
+                break
+
+            all_new_candidates = []
+            for log_prob, sequence in active_beams:
+                input_ids = sequence[-block_size:]
+                input_tensor = torch.tensor([input_ids], dtype=torch.long, device=self.device)
+                
+                logits = self.model(input_tensor)[:, -1, :]
+                next_token_log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+                top_k_log_probs, top_k_ids = torch.topk(next_token_log_probs, self.beam_width, dim=-1)
+
+                for i in range(self.beam_width):
+                    next_id = top_k_ids[0, i].item()
+                    new_log_prob = log_prob + top_k_log_probs[0, i].item()
+                    new_sequence = sequence + [next_id]
+                    all_new_candidates.append((new_log_prob, new_sequence))
+
+            # Filter candidates based on the "healed" prefix (only on the first step)
+            if step == 0 and prefix_to_filter:
+                filtered_candidates = []
+                for log_prob, seq in all_new_candidates:
+                    # Decode only the newly generated part for the check
+                    generated_part = self.tokenizer.decode(seq[len(context_ids):])
+                    if generated_part.startswith(prefix_to_filter):
+                        filtered_candidates.append((log_prob, seq))
+                all_new_candidates = filtered_candidates
+            
+            active_beams = []
+            # Sort all potential new beams by their score
+            all_new_candidates.sort(key=lambda x: x[0], reverse=True)
+            
+            for log_prob, sequence in all_new_candidates[:self.beam_width]:
+                if sequence[-1] == self.newline_token_id:
+                    terminated_hypotheses.append((log_prob, sequence))
+                else:
+                    active_beams.append((log_prob, sequence))
+            
+            # Dynamic stopping criteria
+            if terminated_hypotheses:
+                best_terminated_score, _ = max(terminated_hypotheses, key=lambda x: x[0])
+                # Stop if all active beams are much worse than the best completed one
+                if not active_beams or max(active_beams, key=lambda x: x[0])[0] < best_terminated_score - np.log(self.stop_factor_k):
+                    break
+        
+        # Restore model's original training state if it was training
+        if is_training:
+            self.model.train()
+        
+        # If no suggestion ends in a newline, return nothing
+        if not terminated_hypotheses:
+            print('Info: Found no terminated hypotheses')
+            return ""
+        
+        non_empty_hypotheses = []
+        for log_prob, sequence in terminated_hypotheses:
+            generated_text = self.tokenizer.decode(sequence[len(context_ids):]).strip()
+            if generated_text:
+                non_empty_hypotheses.append((log_prob, sequence))
+        
+        if non_empty_hypotheses:
+            _, best_sequence = max(non_empty_hypotheses, key=lambda x: x[0])
+        else:
+            _, best_sequence = max(terminated_hypotheses, key=lambda x: x[0])
+
+        full_suggestion_text = self.tokenizer.decode(best_sequence)
+
+        # Return only the newly generated part of the text
+        return full_suggestion_text[len(healed_context):]
 
 
 @torch.no_grad()
-def estimate_loss(model, data_gen_factory, loss_fn, eval_iters, batch_size, device):
+def estimate_loss(model, val_loader, loss_fn, eval_iters, device):
     out = {}
     model.eval()
     
-    val_generator = data_gen_factory('val')
-    
     losses = torch.zeros(eval_iters)
+    val_iterator = iter(val_loader)
+
     for k in range(eval_iters):
-        X, Y = get_batch(val_generator, batch_size, device)
-        if X is None:
-            losses = losses[:k]
-            break
+        X, Y = next(val_iterator)
+        X, Y = X.to(device), Y.to(device)
         logits = model(X)
         B, T, C = logits.shape
         logits = logits.view(B * T, C)
@@ -425,38 +541,34 @@ def generate(model, tokenizer, start_string, max_new_tokens, device):
     if is_training:
         model.train()
     
-    breakpoint()
-        
     return generated_text
 
 
 def main():
     # Hyperparameters
     BATCH_SIZE = 8
-    BLOCK_SIZE = 256
+    BLOCK_SIZE = 512
     LEARNING_RATE = 1e-4
-    TRAINING_STEPS = 50000
-    EVAL_INTERVAL = 500
-    EVAL_ITERS = 50
+    TRAINING_STEPS = 300_000
+    EVAL_INTERVAL = 10_000
+    EVAL_ITERS = 1_000
+    VAL_SET_SIZE = 3_000
+    NUM_WORKERS = max(1, os.cpu_count() // 2) 
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     BEST_MODEL_PATH = 'python_model.pth'
 
     print("Initializing tokenizer...")
     # pycharm people used a special tokenizer for python code
-    tokenizer = CodeTokenizer().load('./tokenizer_training_data/custom_code_tokenizer.json')
+    tokenizer = CodeTokenizer.load('./tokenizer_training_data/custom_code_tokenizer.json')
 
-    def data_gen_factory(split):
-        if split == 'train':
-            dataset = load_dataset("bigcode/the-stack", data_dir="data/python", split="train", streaming=True)
-        else:
-            # For validation, we take a small, non-streamed part of the dataset to have consistent validation loss.
-            # Here we are just re-using the start of the training set for simplicity. 
-            # In a real scenario, you'd use a dedicated validation split.
-            dataset = load_dataset("bigcode/the-stack", data_dir="data/python", split="train", streaming=True).take(1000)
-        return data_generator(dataset, tokenizer, BLOCK_SIZE)
-
-    train_generator = data_gen_factory('train')
+    data_stream = load_dataset('bigcode/the-stack', data_dir='data/python', split='train', streaming=True)
+    raw_val_dataset = data_stream.take(VAL_SET_SIZE)
+    raw_train_dataset = data_stream.skip(VAL_SET_SIZE)
+    val_dataset = StreamingTokenizedDataset(raw_val_dataset, tokenizer, BLOCK_SIZE)
+    train_dataset = StreamingTokenizedDataset(raw_train_dataset, tokenizer, BLOCK_SIZE)
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS, pin_memory=True)
 
     model_config = QWEN_CONFIG_06_B
     model_config["vocab_size"] = tokenizer.get_vocab_size()
@@ -466,12 +578,11 @@ def main():
     print(f"Model has {sum(p.numel() for p in model.parameters())/1e6:.2f}M parameters")
     
     # Using torch.compile for a speed-up
-    try:
-        model = torch.compile(model)
-    except Exception as e:
-        print(f"Could not compile model: {e}. Running un-compiled.")
+    model = torch.compile(model, fullgraph=True)
+    
+    generator = FullLineGenerator(model=model, tokenizer=tokenizer, device=DEVICE)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, fused=True)
     loss_fn = nn.CrossEntropyLoss()
 
     WARMUP_STEPS = round(TRAINING_STEPS * 0.1)
@@ -482,15 +593,57 @@ def main():
     print(f"\nStarting training on {DEVICE}...")
     best_val_loss = float('inf')
 
-    pbar = tqdm(range(TRAINING_STEPS), desc='Training')
-    for step in pbar:
-        if step % EVAL_INTERVAL == 0 or step == TRAINING_STEPS - 1:
-            losses = estimate_loss(model, data_gen_factory, loss_fn, EVAL_ITERS, BATCH_SIZE, DEVICE)
+    # TODO refactor
+    # from torch.profiler import profile, record_function, ProfilerActivity
+    # ACCUMULATION_STEPS = 4
+
+    # with profile(
+    #     activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+    #     schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=1),
+    #     on_trace_ready=torch.profiler.tensorboard_trace_handler('./log/model'),
+    #     record_shapes=True,
+    #     profile_memory=True,
+    #     with_stack=True
+    # ) as prof:
+    # pbar = tqdm(enumerate(train_loader), desc='Training')
+    # for step, (xb, yb) in pbar:
+    #     if step >= 100:
+    #         break
+    #     xb, yb = xb.to(DEVICE), yb.to(DEVICE)
+    #     logits = model(xb)
+    #     B, T, C = logits.shape
+    #     logits = logits.view(B * T, C)
+    #     targets = yb.view(B * T)
+    #     loss = loss_fn(logits, targets)
+    #     loss /= ACCUMULATION_STEPS
+    #     loss.backward()
+
+    #     if (step + 1) % ACCUMULATION_STEPS == 0:
+    #         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    #         optimizer.step()
+    #         scheduler.step()
+    #         optimizer.zero_grad(set_to_none=True)
+        
+        # prof.step()
+
+    # print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+
+    print('Starting training')
+    pbar = tqdm(enumerate(train_loader), desc='Training')
+    for step, (xb, yb) in pbar:
+        if step >= TRAINING_STEPS:
+            break
+        if step + 1 % EVAL_INTERVAL == 0 or step == TRAINING_STEPS - 1:
+            losses = estimate_loss(model, val_loader, loss_fn, EVAL_ITERS, DEVICE)
             val_loss = losses.get('val', float('inf'))
             print(f'\n\nStep {step}: validation loss {val_loss:.4f}')
 
+            start_prompt = "import torch\n\ndef forward(self, x):\n"
+            print(f"--- Generating beam search line at step {step} ---")
+            # suggestion = generator.generate(current_line=start_prompt)
+            # print(start_prompt + suggestion)
+            print('todo line complete disabled')
             print(f"--- Generating sample text at step {step} ---")
-            start_prompt = "import torch\n\ndef forward(self, x):"
             generated_text = generate(
                 model, 
                 tokenizer, 
@@ -508,11 +661,7 @@ def main():
                 print(f'New best val loss {best_val_loss:.4f} -> {val_loss:.4f}. Saving new model to {BEST_MODEL_PATH}\n')
                 best_val_loss = val_loss
 
-        xb, yb = get_batch(train_generator, BATCH_SIZE, DEVICE)
-        if xb is None:
-            print("Data generator exhausted. Ending training.")
-            break
-
+        xb, yb = xb.to(DEVICE), yb.to(DEVICE)
         logits = model(xb)
         B, T, C = logits.shape
         logits = logits.view(B * T, C)
@@ -526,7 +675,8 @@ def main():
         scheduler.step()
         
         current_lr = scheduler.get_last_lr()[0]
-        pbar.set_description(f"Training (loss: {loss.item():.4f}, lr: {current_lr:.6f})")
+        if step % 50 == 0:
+            pbar.set_description(f"Training (loss: {loss.item():.4f}, lr: {current_lr:.6f})")
 
     print('Training finished.')
 
@@ -543,7 +693,7 @@ def main():
 
 
     print("\nGenerating final Python code sample...")
-    start_prompt = "import torch\n\ndef forward(self, x):"
+    start_prompt = "import torch\n\ndef forward(self, x):\n"
     generated_text = generate(model_to_load, tokenizer, start_string=start_prompt, max_new_tokens=150, device=DEVICE)
     print("\n--- FINAL GENERATED CODE ---")
     print(generated_text)

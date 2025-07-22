@@ -1,0 +1,6 @@
+tqdm==4.67.1
+tokenizers==0.21.2
+torch==2.7.1
+datasets==4.0.0
+numpy==2.2.6
+tokenize_rt==6.2.0

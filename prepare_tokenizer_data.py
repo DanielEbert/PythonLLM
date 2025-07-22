@@ -20,7 +20,7 @@ def create_tokenizer_training_data(output_path: str, num_samples: int):
 if __name__ == '__main__':
     DATA_DIR = "tokenizer_training_data"
     OUTPUT_FILE = os.path.join(DATA_DIR, "python_processed_for_tokenizer.txt")
-    SAMPLES_TO_PROCESS = 5000 # Increase for a better tokenizer
+    SAMPLES_TO_PROCESS = 50000 # Increase for a better tokenizer
 
     os.makedirs(DATA_DIR, exist_ok=True)
     create_tokenizer_training_data(OUTPUT_FILE, SAMPLES_TO_PROCESS)
