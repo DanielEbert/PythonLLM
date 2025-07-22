@@ -5,3 +5,4 @@ kernel_report.ncu-rep
 log/
 prof.qdstrm
 prof20.nsys-rep
+model.pth
