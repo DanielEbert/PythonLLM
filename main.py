@@ -553,13 +553,12 @@ def main():
     EVAL_INTERVAL = 10_000
     EVAL_ITERS = 1_000
     VAL_SET_SIZE = 3_000
-    NUM_WORKERS = max(1, os.cpu_count() // 2) 
+    NUM_WORKERS = min(max(1, os.cpu_count() // 2), 3)
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     BEST_MODEL_PATH = 'python_model.pth'
 
     print("Initializing tokenizer...")
-    # pycharm people used a special tokenizer for python code
     tokenizer = CodeTokenizer.load('./tokenizer_training_data/custom_code_tokenizer.json')
 
     data_stream = load_dataset('bigcode/the-stack', data_dir='data/python', split='train', streaming=True)
@@ -633,7 +632,7 @@ def main():
     for step, (xb, yb) in pbar:
         if step >= TRAINING_STEPS:
             break
-        if step + 1 % EVAL_INTERVAL == 0 or step == TRAINING_STEPS - 1:
+        if (step + 1) % EVAL_INTERVAL == 0 or step == TRAINING_STEPS - 1:
             losses = estimate_loss(model, val_loader, loss_fn, EVAL_ITERS, DEVICE)
             val_loss = losses.get('val', float('inf'))
             print(f'\n\nStep {step}: validation loss {val_loss:.4f}')
