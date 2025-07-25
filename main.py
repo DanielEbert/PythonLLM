@@ -522,9 +522,20 @@ def generate(model, tokenizer, start_string, max_new_tokens, device):
         x_cond = x if x.size(1) <= block_size else x[:, -block_size:]
         
         logits = model(x_cond)
+
+        top_k = 5
+        temperature = 1.0
         logits = logits[:, -1, :] # Get logits for the last token
+        top_logits, _ = torch.topk(logits, top_k)
+        min_val = top_logits[:, -1]
+        logits = torch.where(logits < min_val, torch.tensor(-torch.inf).to(device), logits)
+
+        logits = logits / temperature
         probs = torch.softmax(logits, dim=-1)
         next_id = torch.multinomial(probs, num_samples=1)
+
+        # probs = torch.softmax(logits, dim=-1)
+        # next_id = torch.multinomial(probs, num_samples=1)
         
         # Stop if end of text token is generated
         if next_id.item() == tokenizer.eos_token_id:
