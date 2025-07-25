@@ -374,23 +374,20 @@ class FullLineGenerator:
     @torch.no_grad()
     def _token_healing(self, line_prefix):
         for i in range(len(line_prefix), -1, -1):
-            # The part of the token the user might have started typing
-            incomplete_token_part = line_prefix[i:]
+            suffix = line_prefix[i:]
+            if self.tokenizer.token_to_id(suffix) is not None:
+                continue
+
+            prefix = line_prefix[:i]
+            if not prefix:
+                return "", suffix
             
-            # Check if this incomplete part is a prefix of any token in the vocab
-            is_prefix = any(
-                token.startswith(incomplete_token_part) and token != incomplete_token_part
-                for token in self.vocab
-            )
+            prefix_ids = self.tokenizer.encode(prefix).ids
+            reconstruced_prefix = self.tokenizer.decode(prefix_ids)
+
+            if reconstruced_prefix == prefix:
+                return prefix, suffix
             
-            if not is_prefix:
-                # We've found the split point. The character at i-1 is not part
-                # of an incomplete token.
-                context = line_prefix[:i]
-                prefix_to_match = line_prefix[i:]
-                return context, prefix_to_match
-        
-        # This case should not be reached if i goes to 0.
         return "", line_prefix
 
     @torch.no_grad()
@@ -457,7 +454,7 @@ class FullLineGenerator:
                 # Stop if all active beams are much worse than the best completed one
                 if not active_beams or max(active_beams, key=lambda x: x[0])[0] < best_terminated_score - np.log(self.stop_factor_k):
                     break
-        
+            
         # Restore model's original training state if it was training
         if is_training:
             self.model.train()
@@ -546,7 +543,7 @@ def generate(model, tokenizer, start_string, max_new_tokens, device):
 
 def main():
     # Hyperparameters
-    BATCH_SIZE = 8
+    BATCH_SIZE = 3
     BLOCK_SIZE = 512
     LEARNING_RATE = 1e-4
     TRAINING_STEPS = 300_000
@@ -569,7 +566,7 @@ def main():
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS, pin_memory=True)
 
-    model_config = QWEN_CONFIG_06_B
+    model_config = QWEN3_CONFIG_1_7B 
     model_config["vocab_size"] = tokenizer.get_vocab_size()
     model_config["context_length"] = BLOCK_SIZE
     
@@ -627,6 +624,14 @@ def main():
 
     # print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
 
+    val_propmt = '''\
+import torch
+import torch.nn as nn
+
+class Net(nn.Module):
+    def __init__(self):
+'''
+
     print('Starting training')
     pbar = tqdm(enumerate(train_loader), desc='Training')
     for step, (xb, yb) in pbar:
@@ -637,7 +642,6 @@ def main():
             val_loss = losses.get('val', float('inf'))
             print(f'\n\nStep {step}: validation loss {val_loss:.4f}')
 
-            start_prompt = "import torch\n\ndef forward(self, x):\n"
             print(f"--- Generating beam search line at step {step} ---")
             # suggestion = generator.generate(current_line=start_prompt)
             # print(start_prompt + suggestion)
@@ -646,7 +650,7 @@ def main():
             generated_text = generate(
                 model, 
                 tokenizer, 
-                start_string=start_prompt, 
+                start_string=val_propmt, 
                 max_new_tokens=100, 
                 device=DEVICE
             )
@@ -680,7 +684,7 @@ def main():
     print('Training finished.')
 
     if os.path.exists(BEST_MODEL_PATH):
-        final_model_config = QWEN_CONFIG_06_B
+        final_model_config = QWEN3_CONFIG_1_7B
         final_model_config["vocab_size"] = tokenizer.vocab_size
         final_model_config["context_length"] = BLOCK_SIZE
         model_to_load = Qwen3Model(final_model_config).to(DEVICE)
@@ -692,8 +696,7 @@ def main():
 
 
     print("\nGenerating final Python code sample...")
-    start_prompt = "import torch\n\ndef forward(self, x):\n"
-    generated_text = generate(model_to_load, tokenizer, start_string=start_prompt, max_new_tokens=150, device=DEVICE)
+    generated_text = generate(model_to_load, tokenizer, start_string=val_propmt, max_new_tokens=150, device=DEVICE)
     print("\n--- FINAL GENERATED CODE ---")
     print(generated_text)
 
