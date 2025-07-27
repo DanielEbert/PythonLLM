@@ -1,5 +1,4 @@
 *.pth
-tokenizer_training_data/
 __pycache__
 kernel_report.ncu-rep
 log/

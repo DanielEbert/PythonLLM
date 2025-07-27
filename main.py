@@ -556,8 +556,8 @@ def main():
     # Hyperparameters
     BATCH_SIZE = 3
     BLOCK_SIZE = 512
-    LEARNING_RATE = 1e-4
-    TRAINING_STEPS = 300_000
+    LEARNING_RATE = 5e-5
+    TRAINING_STEPS = 600_000
     EVAL_INTERVAL = 10_000
     EVAL_ITERS = 1_000
     VAL_SET_SIZE = 3_000
@@ -583,13 +583,18 @@ def main():
     
     model = Qwen3Model(model_config).to(DEVICE)
     print(f"Model has {sum(p.numel() for p in model.parameters())/1e6:.2f}M parameters")
-    
+
+    if os.path.exists(BEST_MODEL_PATH):
+        print('Loading model')
+        model.load_state_dict(torch.load(BEST_MODEL_PATH, map_location=DEVICE))
+        print(f"Model weights loaded successfully from {BEST_MODEL_PATH}")
+
     # Using torch.compile for a speed-up
     model = torch.compile(model, fullgraph=True)
     
     generator = FullLineGenerator(model=model, tokenizer=tokenizer, device=DEVICE)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, fused=True)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, fused=True, weight_decay=0.01)
     loss_fn = nn.CrossEntropyLoss()
 
     WARMUP_STEPS = round(TRAINING_STEPS * 0.1)
@@ -599,41 +604,6 @@ def main():
 
     print(f"\nStarting training on {DEVICE}...")
     best_val_loss = float('inf')
-
-    # TODO refactor
-    # from torch.profiler import profile, record_function, ProfilerActivity
-    # ACCUMULATION_STEPS = 4
-
-    # with profile(
-    #     activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-    #     schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=1),
-    #     on_trace_ready=torch.profiler.tensorboard_trace_handler('./log/model'),
-    #     record_shapes=True,
-    #     profile_memory=True,
-    #     with_stack=True
-    # ) as prof:
-    # pbar = tqdm(enumerate(train_loader), desc='Training')
-    # for step, (xb, yb) in pbar:
-    #     if step >= 100:
-    #         break
-    #     xb, yb = xb.to(DEVICE), yb.to(DEVICE)
-    #     logits = model(xb)
-    #     B, T, C = logits.shape
-    #     logits = logits.view(B * T, C)
-    #     targets = yb.view(B * T)
-    #     loss = loss_fn(logits, targets)
-    #     loss /= ACCUMULATION_STEPS
-    #     loss.backward()
-
-    #     if (step + 1) % ACCUMULATION_STEPS == 0:
-    #         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-    #         optimizer.step()
-    #         scheduler.step()
-    #         optimizer.zero_grad(set_to_none=True)
-        
-        # prof.step()
-
-    # print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
 
     val_propmt = '''\
 import torch
